@@ -1,10 +1,10 @@
 name: Build and Release (v1.0.0)
 
 on:
-  workflow_dispatch:    # 仅支持手动触发
+  workflow_dispatch:
 
 permissions:
-  contents: write       # 创建 Release 和 Tag 所需权限
+  contents: write
 
 jobs:
   build:
@@ -13,14 +13,12 @@ jobs:
     strategy:
       matrix:
         include:
-          # Windows
           - goos: windows
             goarch: amd64
             ext: '.exe'
           - goos: windows
             goarch: '386'
             ext: '.exe'
-          # Linux
           - goos: linux
             goarch: amd64
             ext: ''
@@ -33,14 +31,12 @@ jobs:
           - goos: linux
             goarch: arm
             ext: ''
-          # macOS (darwin)
           - goos: darwin
             goarch: amd64
             ext: ''
           - goos: darwin
             goarch: arm64
             ext: ''
-          # FreeBSD
           - goos: freebsd
             goarch: amd64
             ext: ''
@@ -79,6 +75,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
