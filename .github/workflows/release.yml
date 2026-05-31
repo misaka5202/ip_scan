@@ -1,0 +1,119 @@
+name: Build and Release (v1.0.0)
+
+on:
+  workflow_dispatch:    # 仅支持手动触发
+
+permissions:
+  contents: write       # 创建 Release 和 Tag 所需权限
+
+jobs:
+  build:
+    name: Build for ${{ matrix.goos }} / ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Windows
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+          - goos: windows
+            goarch: '386'
+            ext: '.exe'
+          # Linux
+          - goos: linux
+            goarch: amd64
+            ext: ''
+          - goos: linux
+            goarch: '386'
+            ext: ''
+          - goos: linux
+            goarch: arm64
+            ext: ''
+          - goos: linux
+            goarch: arm
+            ext: ''
+          # macOS (darwin)
+          - goos: darwin
+            goarch: amd64
+            ext: ''
+          - goos: darwin
+            goarch: arm64
+            ext: ''
+          # FreeBSD
+          - goos: freebsd
+            goarch: amd64
+            ext: ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build static binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -ldflags="-s -w -X main.Version=v1.0.0" \
+            -o dist/ip_scan_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }} .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ip_scan_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/ip_scan_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+
+  release:
+    name: Create Release and Upload Assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Move binaries to dist
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          ls -la dist/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create Git Tag v1.0.0 (if not exists)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "v1.0.0" >/dev/null 2>&1; then
+            echo "Tag v1.0.0 already exists, skipping creation."
+          else
+            git tag v1.0.0
+            git push origin v1.0.0
+          fi
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: v1.0.0
+          files: |
+            dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
