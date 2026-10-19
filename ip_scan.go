@@ -1,3 +1,7 @@
+// Package main 实现代理扫描与弱口令爆破工具。
+//
+// 支持 SOCKS5 / HTTP / HTTPS 代理，通过 iplocate.io 获取出口与入口 IP 的地理信息，
+// 并可加载密码本对需要认证的代理进行弱口令检测。扫描结果可导出为 CSV。
 package main
 
 import (
@@ -14,7 +18,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -25,8 +28,10 @@ import (
 )
 
 const (
-	ipCheckURL    = "https://api.ipapi.is/"
-	cnGeoJSONPURL = "https://ipv4.ping0.cc/geo/jsonp/callback"
+	// ipLocateBaseURL 是 iplocate.io 的查询接口。
+	//   - 查询代理出口自身：https://www.iplocate.io/api/lookup
+	//   - 查询指定 IP：    https://www.iplocate.io/api/lookup/{ip}
+	ipLocateBaseURL = "https://www.iplocate.io/api/lookup/"
 )
 
 var (
@@ -38,42 +43,81 @@ var (
 	debug      = flag.Bool("debug", false, "开启调试日志")
 	proxyType  = flag.String("t", "", "代理协议类型: socks5, http 或 https (必需)")
 	skipVerify = flag.Bool("skip-verify", true, "跳过HTTPS代理的证书验证 (默认 true)")
-	cnMode     = flag.Bool("cn", false, "使用中文地理信息 (ping0.cc)，出口显示中文，入口保持英文")
 )
 
+// ErrProxyAuthRequired 表示代理要求认证（HTTP 407）。
 var ErrProxyAuthRequired = errors.New("proxy requires authentication")
+
+// ErrInvalidAuth 表示代理认证失败（HTTP 401/403 等）。
 var ErrInvalidAuth = errors.New("invalid username/password")
 
+// IPInfo 保存 iplocate.io /api/lookup 返回的字段。
+// 兼容原有字段（IP、Country、City、ISP、Hosting、Tag），并补充 ASN / company / privacy 等明细。
 type IPInfo struct {
 	IP          string
 	Country     string
+	CountryCode string
 	City        string
-	ISP         string
-	ASNType     string
-	CompanyType string
-	Tag         string
+	Continent   string
+	Subdivision string
+	Timezone    string
+	PostalCode  string
+	Latitude    float64
+	Longitude   float64
+
+	// ISP 主要用于输出展示（优先取 ASN 名称，回退 company.name）
+	ISP string
+
+	// ASN 明细（对应 iplocate 响应的 asn.* 字段）
+	ASN       string
+	ASNName   string
+	ASNRoute  string
+	ASNDomain string
+	ASNType   string
+	RIR       string
+
+	// company 明细
+	CompanyName    string
+	CompanyType    string
+	CompanyNetwork string
+
+	// privacy 明细
+	Hosting      bool // 与 worker 一致：取自 privacy.is_hosting
+	IsDatacenter bool
+	IsBogon      bool
+	IsProxy      bool
+	IsVPN        bool
+	IsTor        bool
+	IsAbuser     bool
+	IsCrawler    bool
+	IsSatellite  bool
+
+	Tag string
 }
 
+// ProxyResult 保存单个代理的最终扫描结果。
 type ProxyResult struct {
-	IP           string
-	Port         int
-	Username     string
-	Password     string
+	IP           string // 代理入口 IP
+	Port         int    // 代理端口
+	Username     string // 成功认证的用户名（空认证时为空）
+	Password     string // 成功认证的密码（空认证时为空）
 	Success      bool
-	OutboundIP   string
-	OutInfo      string
-	OutTag       string
-	InInfo       string
+	OutboundIP   string // 出口 IP
+	OutInfo      string // 出口展示信息，格式：地区_城市[ISP]
+	OutTag       string // CSV 类型标记：家宽 / 商宽
+	InInfo       string // 入口展示信息
 	ErrorMsg     string
-	ResponseTime int64
-	Protocol     string
+	ResponseTime int64  // 出口/入口信息采集耗时（毫秒）
+	Protocol     string // socks5 / http / https
 }
 
+// Credential 表示一组用户名/密码凭据。
 type Credential struct {
 	Username string
 	Password string
 }
 
+// ProgressTracker 负责并发安全地统计扫描进度并渲染进度条。
 type ProgressTracker struct {
 	total     int64
 	completed int64
@@ -82,6 +126,7 @@ type ProgressTracker struct {
 	startTime time.Time
 }
 
+// NewProgressTracker 创建进度跟踪器。
 func NewProgressTracker(total int64) *ProgressTracker {
 	return &ProgressTracker{
 		total:     total,
@@ -91,6 +136,7 @@ func NewProgressTracker(total int64) *ProgressTracker {
 	}
 }
 
+// Add 累加完成数与成功数，并刷新进度条。
 func (p *ProgressTracker) Add(completedDelta, successDelta int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -99,6 +145,7 @@ func (p *ProgressTracker) Add(completedDelta, successDelta int64) {
 	p.render()
 }
 
+// render 渲染单行进度条（需在锁内调用）。
 func (p *ProgressTracker) render() {
 	percent := float64(p.completed) / float64(p.total) * 100
 	elapsed := time.Since(p.startTime).Seconds()
@@ -110,6 +157,7 @@ func (p *ProgressTracker) render() {
 		bar, percent, p.completed, p.total, p.success, rate)
 }
 
+// Finish 输出最终进度并换行。
 func (p *ProgressTracker) Finish() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -117,53 +165,40 @@ func (p *ProgressTracker) Finish() {
 	fmt.Println()
 }
 
+// debugPrintf 仅在 -debug 开启时输出调试日志。
 func debugPrintf(format string, v ...interface{}) {
 	if *debug {
 		log.Printf("[DEBUG] "+format, v...)
 	}
 }
 
-func getIPTypeTags(companyType, asnType string) (csvTag string, screenTag string) {
-	if companyType == "isp" && asnType == "isp" {
-		return "家宽", "✅家宽"
+// getIPTypeTags 根据 hosting 标记返回 CSV 标签和控制台标签。
+func getIPTypeTags(hosting bool) (csvTag string, screenTag string) {
+	if hosting {
+		return "商宽", "🟥商宽"
 	}
-	switch companyType {
-	case "education":
-		return "教育", "🎓教育"
-	case "government":
-		return "政府", "🏛政府"
-	case "banking":
-		return "金融", "💰金融"
-	case "business":
-		return "企业", "🏢企业"
-	case "hosting":
-		return "机房", "🟥机房"
-	}
-	switch asnType {
-	case "education":
-		return "教育", "🎓教育"
-	case "government":
-		return "政府", "🏛政府"
-	case "banking":
-		return "金融", "💰金融"
-	case "business":
-		return "企业", "🏢企业"
-	case "hosting":
-		return "机房", "🟥机房"
-	}
-	return "机房", "🟥机房"
+	return "家宽", "✅家宽"
 }
 
+// doFetchViaProxy 通过代理请求 iplocate.io/api/lookup 获取 IP 信息。
+// queryIP 为空时，查询代理出口自身的 IP 信息（对应 /api/lookup）；
+// queryIP 不为空时，查询指定 IP 的信息（对应 /api/lookup/{ip}），常用于查询入口（代理本身）IP 的信息。
+//
+// 字段映射：
+//   - Hosting <- privacy.is_hosting
+//   - ISP     <- asn.name（回退 company.name）
+//   - is_bogon / is_proxy / is_vpn / is_tor / is_abuser <- privacy.*
 func doFetchViaProxy(client *http.Client, queryIP string) (*IPInfo, error) {
-	urlStr := ipCheckURL
+	urlStr := ipLocateBaseURL
 	if queryIP != "" {
-		urlStr = fmt.Sprintf("%s?q=%s", ipCheckURL, queryIP)
+		urlStr += queryIP
 	}
+
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "proxy-scanner/1.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
@@ -171,10 +206,12 @@ func doFetchViaProxy(client *http.Client, queryIP string) (*IPInfo, error) {
 		return nil, err
 	}
 	defer func() {
+		// 确保连接可复用，同时释放响应体。
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}()
 
+	// 根据 HTTP 状态码区分认证相关错误，便于爆破阶段快速判断。
 	if resp.StatusCode == http.StatusProxyAuthRequired {
 		return nil, ErrProxyAuthRequired
 	}
@@ -185,127 +222,115 @@ func doFetchViaProxy(client *http.Client, queryIP string) (*IPInfo, error) {
 		return nil, fmt.Errorf("HTTP status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 65536))
 	if err != nil {
 		return nil, err
 	}
-	var data map[string]interface{}
+
+	// 使用匿名结构体承接 iplocate.io 响应，仅提取需要的字段。
+	var data struct {
+		IP          string  `json:"ip"`
+		Country     string  `json:"country"`
+		CountryCode string  `json:"country_code"`
+		City        string  `json:"city"`
+		Continent   string  `json:"continent"`
+		Subdivision string  `json:"subdivision"`
+		Timezone    string  `json:"time_zone"`
+		PostalCode  string  `json:"postal_code"`
+		Latitude    float64 `json:"latitude"`
+		Longitude   float64 `json:"longitude"`
+		ASN         struct {
+			ASN    string `json:"asn"`
+			Name   string `json:"name"`
+			Route  string `json:"route"`
+			Domain string `json:"domain"`
+			Type   string `json:"type"`
+			RIR    string `json:"rir"`
+		} `json:"asn"`
+		Company struct {
+			Name        string `json:"name"`
+			Domain      string `json:"domain"`
+			Type        string `json:"type"`
+			Network     string `json:"network"`
+			AbuserScore string `json:"abuser_score"`
+		} `json:"company"`
+		Privacy struct {
+			IsAbuser     bool `json:"is_abuser"`
+			IsBogon      bool `json:"is_bogon"`
+			IsCrawler    bool `json:"is_crawler"`
+			IsDatacenter bool `json:"is_datacenter"`
+			IsHosting    bool `json:"is_hosting"`
+			IsICANN      bool `json:"is_icann"`
+			IsProxy      bool `json:"is_proxy"`
+			IsSatellite  bool `json:"is_satellite"`
+			IsTor        bool `json:"is_tor"`
+			IsVPN        bool `json:"is_vpn"`
+		} `json:"privacy"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+
 	if err := json.Unmarshal(body, &data); err != nil {
 		return nil, err
 	}
+	if data.Error != "" {
+		return nil, fmt.Errorf("iplocate错误: %s", data.Error)
+	}
+	if data.Message != "" && data.IP == "" {
+		return nil, fmt.Errorf("iplocate错误: %s", data.Message)
+	}
+	if data.IP == "" {
+		return nil, fmt.Errorf("iplocate返回无效数据")
+	}
 
-	info := &IPInfo{}
-	if ip, ok := data["ip"].(string); ok {
-		info.IP = ip
+	// ISP：优先 ASN 名称，其次 company 名称。
+	isp := strings.TrimSpace(data.ASN.Name)
+	if isp == "" {
+		isp = strings.TrimSpace(data.Company.Name)
 	}
-	if loc, ok := data["location"].(map[string]interface{}); ok {
-		if c, ok := loc["country"].(string); ok {
-			info.Country = c
-		}
-		if ci, ok := loc["city"].(string); ok {
-			info.City = ci
-		}
-		if info.City == "" {
-			if state, ok := loc["state"].(string); ok {
-				info.City = state
-			}
-		}
+	if isp == "" {
+		isp = "未知ISP"
 	}
-	var asnOrg string
-	if asn, ok := data["asn"].(map[string]interface{}); ok {
-		if org, ok := asn["asn_org"].(string); ok {
-			asnOrg = org
-		}
-		if tp, ok := asn["type"].(string); ok {
-			info.ASNType = tp
-		}
+
+	// Hosting 判定使用 privacy.is_hosting。
+	hosting := data.Privacy.IsHosting
+
+	info := &IPInfo{
+		IP:             data.IP,
+		Country:        data.Country,
+		CountryCode:    data.CountryCode,
+		City:           data.City,
+		Continent:      data.Continent,
+		Subdivision:    data.Subdivision,
+		Timezone:       data.Timezone,
+		PostalCode:     data.PostalCode,
+		Latitude:       data.Latitude,
+		Longitude:      data.Longitude,
+		ISP:            isp,
+		ASN:            data.ASN.ASN,
+		ASNName:        data.ASN.Name,
+		ASNRoute:       data.ASN.Route,
+		ASNDomain:      data.ASN.Domain,
+		ASNType:        data.ASN.Type,
+		RIR:            data.ASN.RIR,
+		CompanyName:    data.Company.Name,
+		CompanyType:    data.Company.Type,
+		CompanyNetwork: data.Company.Network,
+		Hosting:        hosting,
+		IsDatacenter:   data.Privacy.IsDatacenter || data.Privacy.IsHosting,
+		IsBogon:        data.Privacy.IsBogon,
+		IsProxy:        data.Privacy.IsProxy,
+		IsVPN:          data.Privacy.IsVPN,
+		IsTor:          data.Privacy.IsTor,
+		IsAbuser:       data.Privacy.IsAbuser,
+		IsCrawler:      data.Privacy.IsCrawler,
+		IsSatellite:    data.Privacy.IsSatellite,
 	}
-	if company, ok := data["company"].(map[string]interface{}); ok {
-		if name, ok := company["name"].(string); ok {
-			info.ISP = name
-		}
-		if tp, ok := company["type"].(string); ok && tp != "" {
-			info.CompanyType = tp
-		}
-	}
-	if info.ISP == "" && asnOrg != "" {
-		info.ISP = asnOrg
-	} else if info.ISP == "" {
-		info.ISP = "Unknown ISP"
-	}
-	_, info.Tag = getIPTypeTags(info.CompanyType, info.ASNType)
+	_, info.Tag = getIPTypeTags(info.Hosting)
 	return info, nil
 }
 
-func fetchCNGeo(client *http.Client, queryIP string) (country, city, isp, asn string, err error) {
-	urlStr := cnGeoJSONPURL
-	if queryIP != "" {
-		urlStr = fmt.Sprintf("%s?ip=%s", cnGeoJSONPURL, queryIP)
-	}
-	req, err := http.NewRequest("GET", urlStr, nil)
-	if err != nil {
-		return "", "", "", "", err
-	}
-	req.Header.Set("User-Agent", "proxy-scanner/1.0")
-	req.Header.Set("Accept", "text/javascript, application/javascript")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", "", "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", "", fmt.Errorf("ping0.cc JSONP HTTP %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	bodyStr := string(body)
-	re := regexp.MustCompile(`callback\(([^)]+)\)`)
-	matches := re.FindStringSubmatch(bodyStr)
-	if len(matches) < 2 {
-		return "", "", "", "", fmt.Errorf("无法解析 JSONP 响应")
-	}
-	argsStr := matches[1]
-	jsonArray := "[" + argsStr + "]"
-	var args []string
-	if err := json.Unmarshal([]byte(jsonArray), &args); err != nil {
-		parts := strings.Split(argsStr, ",")
-		for i, p := range parts {
-			parts[i] = strings.Trim(p, `" `)
-		}
-		args = parts
-	}
-	if len(args) < 4 {
-		return "", "", "", "", fmt.Errorf("JSONP 参数不足，得到 %d 个", len(args))
-	}
-	location := strings.Trim(args[1], `"`)
-	asnStr := strings.Trim(args[2], `"`)
-	orgStr := strings.Trim(args[3], `"`)
-
-	cleanLoc := regexp.MustCompile(`[^\p{Han}a-zA-Z0-9\s_]`).ReplaceAllString(location, "")
-	space := regexp.MustCompile(`\s+`)
-	cleanLoc = space.ReplaceAllString(cleanLoc, " ")
-	parts := strings.Fields(cleanLoc)
-	if len(parts) == 0 {
-		country = ""
-		city = ""
-	} else if len(parts) == 1 {
-		country = parts[0]
-		city = ""
-	} else {
-		country = parts[0]
-		city = strings.Join(parts[1:], "_")
-	}
-	isp = orgStr
-	asn = asnStr
-	return country, city, isp, asn, nil
-}
-
+// createProxyClient 根据协议类型创建带认证信息的 HTTP 客户端。
 func createProxyClient(proxyAddr, username, password, proxyType string, timeout time.Duration, skipVerify bool) (*http.Client, error) {
 	switch proxyType {
 	case "socks5":
@@ -352,7 +377,9 @@ func createProxyClient(proxyAddr, username, password, proxyType string, timeout 
 	}
 }
 
-func fetchProxyInfoWithCN(client *http.Client, entryIP string) (exitInfo *IPInfo, entryInfo *IPInfo, elapsed time.Duration, err error) {
+// fetchProxyInfo 通过代理获取出口信息和入口信息。
+// 返回的 elapsed 为整个信息采集过程的耗时；入口查询失败时不会返回错误，而是使用“未知”占位。
+func fetchProxyInfo(client *http.Client, entryIP string) (exitInfo *IPInfo, entryInfo *IPInfo, elapsed time.Duration, err error) {
 	start := time.Now()
 	defer func() {
 		elapsed = time.Since(start)
@@ -363,17 +390,6 @@ func fetchProxyInfoWithCN(client *http.Client, entryIP string) (exitInfo *IPInfo
 		return nil, nil, 0, err
 	}
 	debugPrintf("出口信息获取成功 IP=%s, 类型=%s", exitInfo.IP, exitInfo.Tag)
-
-	if *cnMode {
-		if cnCountry, cnCity, cnISP, _, err2 := fetchCNGeo(client, ""); err2 == nil {
-			debugPrintf("出口中文信息获取成功: 国家=%s, 城市=%s, ISP=%s", cnCountry, cnCity, cnISP)
-			exitInfo.Country = cnCountry
-			exitInfo.City = cnCity
-			exitInfo.ISP = cnISP
-		} else {
-			debugPrintf("获取出口中文信息失败: %v", err2)
-		}
-	}
 
 	if entryIP != "" {
 		entryInfo, err = doFetchViaProxy(client, entryIP)
@@ -390,6 +406,7 @@ func fetchProxyInfoWithCN(client *http.Client, entryIP string) (exitInfo *IPInfo
 	return exitInfo, entryInfo, elapsed, nil
 }
 
+// readProxyList 从文件读取代理列表，支持 `IP:端口` 和 `IP 端口` 两种格式。
 func readProxyList(filePath string) ([]string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -426,6 +443,8 @@ func readProxyList(filePath string) ([]string, error) {
 	return proxies, scanner.Err()
 }
 
+// readPasswords 从密码本读取凭据。
+// 若未提供密码本，则返回一个空凭据（用于空认证测试）。
 func readPasswords(filePath string) ([]Credential, error) {
 	if filePath == "" {
 		debugPrintf("未提供密码本，将仅使用无认证（空用户名密码）")
@@ -455,6 +474,7 @@ func readPasswords(filePath string) ([]Credential, error) {
 	if len(creds) == 0 {
 		return nil, fmt.Errorf("密码本文件中没有找到任何有效的 \"用户名:密码\" 格式行")
 	}
+	// 去重，避免重复尝试相同凭据。
 	unique := make(map[string]bool)
 	var result []Credential
 	for _, cred := range creds {
@@ -468,6 +488,7 @@ func readPasswords(filePath string) ([]Credential, error) {
 	return result, nil
 }
 
+// formatOutInfo 格式化出口展示信息，格式：地区_城市[ISP]。
 func formatOutInfo(info *IPInfo) string {
 	var parts []string
 	if info.Country != "" {
@@ -488,6 +509,7 @@ func formatOutInfo(info *IPInfo) string {
 	return "未知地区[" + isp + "]"
 }
 
+// formatInInfo 格式化入口展示信息，格式：地区_城市[ISP] 或 地区_城市。
 func formatInInfo(info *IPInfo) string {
 	var parts []string
 	if info.Country != "" {
@@ -510,6 +532,8 @@ func formatInInfo(info *IPInfo) string {
 	return "未知地区"
 }
 
+// parseLocationCityASN 解析 formatOutInfo / formatInInfo 生成的字符串。
+// 返回 region、city、asn 三部分；若字段缺失则返回空字符串。
 func parseLocationCityASN(info string) (region, city, asn string) {
 	lastBracket := strings.LastIndex(info, "[")
 	if lastBracket != -1 && strings.HasSuffix(info, "]") {
@@ -533,6 +557,12 @@ func parseLocationCityASN(info string) (region, city, asn string) {
 	return region, city, asn
 }
 
+// increaseMaxOpenFiles 尝试在 Linux 下提升文件描述符上限。
+//
+// 注意：该命令通过 `bash -c` 在子 shell 中执行，ulimit 的修改不会影响当前进程。
+// 若需真正提升并发能力，建议在启动程序前于 shell 中执行：
+//
+//	ulimit -n 10000
 func increaseMaxOpenFiles() {
 	if runtime.GOOS == "linux" {
 		fmt.Println("正在尝试提升文件描述符的上限...")
@@ -546,6 +576,7 @@ func increaseMaxOpenFiles() {
 	}
 }
 
+// quoteCSV 对 CSV 字段进行引号包裹和转义。
 func quoteCSV(s string) string {
 	if !strings.Contains(s, `"`) {
 		return `"` + s + `"`
@@ -553,6 +584,7 @@ func quoteCSV(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
+// writeResultsToCSV 将成功结果写入 CSV 文件（带 UTF-8 BOM，便于 Excel 打开）。
 func writeResultsToCSV(results []ProxyResult, outputPath string) error {
 	f, err := os.Create(outputPath)
 	if err != nil {
@@ -575,16 +607,24 @@ func writeResultsToCSV(results []ProxyResult, outputPath string) error {
 			continue
 		}
 		outRegion, outCity, outASN := parseLocationCityASN(r.OutInfo)
+
+		// 构造节点字符串：协议://[用户名:密码@]IP:端口#地区_城市[ASN]
 		var node string
 		protocolPrefix := r.Protocol + "://"
-		if outCity != "" && outASN != "" {
-			node = fmt.Sprintf("%s%s:%d#%s_%s[%s]", protocolPrefix, r.IP, r.Port, outRegion, outCity, outASN)
-		} else if outCity != "" && outASN == "" {
-			node = fmt.Sprintf("%s%s:%d#%s_%s", protocolPrefix, r.IP, r.Port, outRegion, outCity)
-		} else if outCity == "" && outASN != "" {
-			node = fmt.Sprintf("%s%s:%d#%s[%s]", protocolPrefix, r.IP, r.Port, outRegion, outASN)
+		var addrPart string
+		if r.Username != "" || r.Password != "" {
+			addrPart = fmt.Sprintf("%s:%s@%s:%d", r.Username, r.Password, r.IP, r.Port)
 		} else {
-			node = fmt.Sprintf("%s%s:%d#%s", protocolPrefix, r.IP, r.Port, outRegion)
+			addrPart = fmt.Sprintf("%s:%d", r.IP, r.Port)
+		}
+		if outCity != "" && outASN != "" {
+			node = fmt.Sprintf("%s%s#%s_%s[%s]", protocolPrefix, addrPart, outRegion, outCity, outASN)
+		} else if outCity != "" && outASN == "" {
+			node = fmt.Sprintf("%s%s#%s_%s", protocolPrefix, addrPart, outRegion, outCity)
+		} else if outCity == "" && outASN != "" {
+			node = fmt.Sprintf("%s%s#%s[%s]", protocolPrefix, addrPart, outRegion, outASN)
+		} else {
+			node = fmt.Sprintf("%s%s#%s", protocolPrefix, addrPart, outRegion)
 		}
 
 		nodeType := r.OutTag
@@ -623,6 +663,7 @@ func writeResultsToCSV(results []ProxyResult, outputPath string) error {
 	return nil
 }
 
+// isAuthError 判断错误是否与代理认证相关。
 func isAuthError(err error) bool {
 	if err == nil {
 		return false
@@ -639,6 +680,7 @@ func isAuthError(err error) bool {
 		strings.Contains(errStr, "Proxy Authentication Required")
 }
 
+// main 解析参数、加载代理与密码本、并发扫描并输出结果。
 func main() {
 	flag.Parse()
 	if *file == "" {
@@ -671,10 +713,11 @@ func main() {
 		fmt.Printf("读取密码本失败: %v\n", err)
 		os.Exit(1)
 	}
+	// 判断是否提供了有效密码本（非仅空认证占位）。
 	hasValidPasswordBook := len(credentials) > 0 && !(len(credentials) == 1 && credentials[0].Username == "" && credentials[0].Password == "")
 
-	fmt.Printf("开始扫描代理 (共 %d 个，类型: %s)，密码本数量: %d，跳过证书验证: %v，中文模式: %v\n",
-		len(proxies), *proxyType, len(credentials), *skipVerify, *cnMode)
+	fmt.Printf("开始扫描代理 (共 %d 个，类型: %s)，密码本数量: %d，跳过证书验证: %v\n",
+		len(proxies), *proxyType, len(credentials), *skipVerify)
 	progress := NewProgressTracker(int64(len(proxies)))
 
 	var mu sync.Mutex
@@ -708,14 +751,14 @@ func main() {
 				entryIP := ipPort[0]
 				port, _ := strconv.Atoi(ipPort[1])
 
-				// 尝试无认证
+				// 第一步：尝试无认证连接。
 				client, err := createProxyClient(proxyAddr, "", "", *proxyType, globalTimeout, *skipVerify)
 				if err == nil {
-					exitInfo, entryInfo, elapsed, err := fetchProxyInfoWithCN(client, entryIP)
+					exitInfo, entryInfo, elapsed, err := fetchProxyInfo(client, entryIP)
 					client.CloseIdleConnections()
 					if err == nil {
 						debugPrintf("[Worker %d] 代理 %s 空认证成功", workerID, proxyAddr)
-						csvTag, screenTag := getIPTypeTags(exitInfo.CompanyType, exitInfo.ASNType)
+						csvTag, screenTag := getIPTypeTags(exitInfo.Hosting)
 						outInfo := formatOutInfo(exitInfo)
 						inInfo := formatInInfo(entryInfo)
 
@@ -749,14 +792,14 @@ func main() {
 					debugPrintf("[Worker %d] 创建无认证客户端失败: %v", workerID, err)
 				}
 
-				// 需要认证但没有密码本则跳过
+				// 需要认证但没有有效密码本则跳过。
 				if !hasValidPasswordBook {
 					debugPrintf("[Worker %d] 代理 %s 需要认证但无有效密码本，跳过", workerID, proxyAddr)
 					progress.Add(1, 0)
 					continue
 				}
 
-				// 爆破凭据（轻量验证，只请求出口一次，忽略返回的详细信息）
+				// 第二步：爆破凭据。每个凭据仅请求出口接口进行轻量验证。
 				var successCred *Credential
 				for idx, cred := range credentials {
 					debugPrintf("[Worker %d] 代理 %s 测试第 %d 个凭据: %s:%s", workerID, proxyAddr, idx+1, cred.Username, cred.Password)
@@ -782,14 +825,14 @@ func main() {
 					continue
 				}
 
-				// 使用成功凭据创建最终客户端，完成完整的三次请求（复用连接）
+				// 第三步：使用成功凭据重新创建客户端，完整采集出口和入口信息。
 				finalClient, err := createProxyClient(proxyAddr, successCred.Username, successCred.Password, *proxyType, globalTimeout, *skipVerify)
 				if err != nil {
 					debugPrintf("[Worker %d] 创建最终客户端失败: %v", workerID, err)
 					progress.Add(1, 0)
 					continue
 				}
-				exitInfo, entryInfo, elapsed, err := fetchProxyInfoWithCN(finalClient, entryIP)
+				exitInfo, entryInfo, elapsed, err := fetchProxyInfo(finalClient, entryIP)
 				finalClient.CloseIdleConnections()
 				if err != nil {
 					debugPrintf("[Worker %d] 获取完整代理信息失败: %v", workerID, err)
@@ -797,7 +840,7 @@ func main() {
 					continue
 				}
 
-				csvTag, screenTag := getIPTypeTags(exitInfo.CompanyType, exitInfo.ASNType)
+				csvTag, screenTag := getIPTypeTags(exitInfo.Hosting)
 				outInfo := formatOutInfo(exitInfo)
 				inInfo := formatInInfo(entryInfo)
 
